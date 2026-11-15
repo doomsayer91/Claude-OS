@@ -1,0 +1,176 @@
+#!/usr/bin/env bash
+# cos - Claude OS maintenance command (Linux build)
+set -uo pipefail
+
+APP_LIST="/usr/share/claudeos/flatpaks.list"
+EXPORT_FILE="${HOME}/claudeos-apps.txt"
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+usage() {
+    cat <<'EOF'
+cos - Claude OS maintenance
+  cos setup         First run: install the default apps and switch to dark mode
+  cos update        Update the system image, apps and containers
+  cos health        OS image, kernel, Secure Boot, GPU, disk, failed services
+  cos status        Show the booted, staged and rollback images
+  cos rollback      Boot the previous system image next time
+  cos clean         Remove unused app runtimes, old containers and old logs
+  cos export        Save the installed app list to ~/claudeos-apps.txt
+  cos import [file] Install every app from that list
+  cos remote          Show remote access status and how to connect
+  cos remote enable   Turn on SSH and Sunshine streaming (for "cos connect" on Windows)
+  cos remote rdp      Open the KDE Remote Desktop (RDP) settings instead
+  cos remote disable  Turn off SSH, Sunshine and RDP
+EOF
+}
+
+RDP_UNIT="app-org.kde.krdpserver.service"
+SUNSHINE_UNIT="app-dev.lizardbyte.app.Sunshine.service"
+
+cmd_remote() {
+    local action="${1:-status}" ip host user
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    host="$(hostname)"
+    user="$(id -un)"
+
+    case "$action" in
+        enable)
+            sudo systemctl enable --now sshd
+            echo "[+] SSH is on"
+            if have ujust; then
+                # Bazzite's own recipe: installs the Sunshine Flatpak and enables its service
+                ujust setup-sunshine enable
+            else
+                echo "ujust not found: install Sunshine manually" >&2
+            fi
+            if have firewall-cmd && sudo firewall-cmd --state >/dev/null 2>&1; then
+                sudo firewall-cmd --permanent --add-service=ssh \
+                    --add-port=47984/tcp --add-port=47989/tcp --add-port=47990/tcp --add-port=48010/tcp \
+                    --add-port=47998-48000/udp
+                sudo firewall-cmd --reload
+            fi
+            echo
+            echo "Next:"
+            echo "  1. Here: open https://localhost:47990 and create the Sunshine login"
+            echo "  2. On Windows: cos link ${ip:-<ip>} ${user}"
+            echo "  3. On Windows: cos pair, then cos connect"
+            have xdg-open && (xdg-open https://localhost:47990 >/dev/null 2>&1 &)
+            ;;
+        rdp)
+            if have firewall-cmd && sudo firewall-cmd --state >/dev/null 2>&1; then
+                sudo firewall-cmd --permanent --add-port=3389/tcp
+                sudo firewall-cmd --reload
+            fi
+            echo "In System Settings, search for Remote Desktop, then:"
+            echo "  1. Turn on the RDP server"
+            echo "  2. Add a username and password under Other Users"
+            echo "Then on Windows: cos rdp   (or: mstsc /v:${ip:-<ip>})"
+            have kcmshell6 && (kcmshell6 kcm_krdpserver >/dev/null 2>&1 &)
+            ;;
+        disable)
+            sudo systemctl disable --now sshd
+            systemctl --user disable --now "$SUNSHINE_UNIT" 2>/dev/null
+            systemctl --user disable --now "$RDP_UNIT" 2>/dev/null
+            echo "SSH, Sunshine and RDP are off."
+            ;;
+        *)
+            echo "Hostname : ${host} (${host}.local on the LAN)"
+            echo "IP       : ${ip:-unknown}"
+            echo "SSH      : $(systemctl is-active sshd 2>/dev/null || true)"
+            echo "Sunshine : $(systemctl --user is-active "$SUNSHINE_UNIT" 2>/dev/null || true)"
+            echo "RDP      : $(systemctl --user is-active "$RDP_UNIT" 2>/dev/null || true)"
+            echo
+            echo "From Windows:"
+            echo "  First time: cos link ${ip:-<ip>} ${user}  then  cos pair"
+            echo "  Desktop   : cos connect"
+            echo "  Terminal  : cos ssh"
+            echo "  Files     : cos files"
+            ;;
+    esac
+}
+
+install_from_list() {
+    local file="$1" id failed=()
+    [[ -r "$file" ]] || { echo "No app list at $file" >&2; return 1; }
+    while IFS= read -r id; do
+        id="${id%%#*}"
+        id="${id//[[:space:]]/}"
+        [[ -z "$id" ]] && continue
+        echo "[+] $id"
+        flatpak install -y --noninteractive flathub "$id" || failed+=("$id")
+    done <"$file"
+    if ((${#failed[@]})); then
+        echo
+        echo "Needs a manual install:"
+        printf '  %s\n' "${failed[@]}"
+    fi
+}
+
+cmd_setup() {
+    install_from_list "$APP_LIST"
+    if have plasma-apply-lookandfeel; then
+        plasma-apply-lookandfeel -a org.kde.breezedark.desktop && echo "[+] Dark mode on"
+    fi
+}
+
+cmd_update() {
+    if have ujust; then
+        ujust update
+    else
+        sudo bootc upgrade
+        flatpak update -y
+    fi
+}
+
+cmd_health() {
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    echo "OS           : ${PRETTY_NAME:-unknown} ${VERSION:-}"
+    echo "Kernel       : $(uname -r)"
+    echo "Uptime       : $(uptime -p)"
+
+    if have bootc && have jq; then
+        local json
+        if json="$(sudo bootc status --format=json 2>/dev/null)"; then
+            echo "Image        : $(jq -r '.status.booted.image.image.image // "unknown"' <<<"$json")"
+            echo "Update staged: $(jq -r 'if .status.staged then "yes, reboot to apply" else "no" end' <<<"$json")"
+            echo "Rollback     : $(jq -r 'if .status.rollback then "available" else "none" end' <<<"$json")"
+        else
+            echo "Image        : could not read bootc status"
+        fi
+    fi
+
+    if have mokutil; then
+        echo "Secure Boot  : $(mokutil --sb-state 2>&1 | head -1)"
+    fi
+    if have lspci; then
+        lspci | grep -Ei 'vga|3d|display' | sed 's/^[^ ]* /GPU          : /'
+    fi
+    echo "Home disk    : $(df -h --output=avail,size "$HOME" | tail -1 | awk '{print $1 " free of " $2}')"
+    echo "Failed units : $(systemctl --failed --no-legend 2>/dev/null | wc -l)"
+}
+
+cmd_clean() {
+    flatpak uninstall --unused -y
+    have podman && podman system prune -f
+    sudo journalctl --vacuum-time=14d
+}
+
+cmd_export() {
+    flatpak list --app --columns=application >"$EXPORT_FILE"
+    echo "App list saved to $EXPORT_FILE"
+}
+
+case "${1:-help}" in
+    setup)    cmd_setup ;;
+    update)   cmd_update ;;
+    health)   cmd_health ;;
+    status)   sudo bootc status ;;
+    rollback) sudo bootc rollback && echo "Reboot to start the previous image." ;;
+    clean)    cmd_clean ;;
+    export)   cmd_export ;;
+    import)   install_from_list "${2:-$EXPORT_FILE}" ;;
+    remote)   cmd_remote "${2:-status}" ;;
+    *)        usage ;;
+esac

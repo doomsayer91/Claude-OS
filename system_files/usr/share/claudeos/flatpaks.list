@@ -1,0 +1,12 @@
+# Apps installed by "cos setup". One Flatpak ID per line; lines starting with # are ignored.
+# Steam is already part of the Bazzite base image.
+org.mozilla.firefox
+com.discordapp.Discord
+com.spotify.Client
+# Epic, GOG and Amazon libraries
+com.heroicgameslauncher.hgl
+com.obsproject.Studio
+# Play games streamed from the Windows rig (Sunshine)
+com.moonlight_stream.Moonlight
+# Logitech mice and keyboards (G HUB has no Linux version)
+io.github.pwr_solaar.solaar
